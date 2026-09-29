@@ -38,11 +38,37 @@ from the database is what produced the original `SQL1005N` retry storm.
 | `purge-archive-logs.sh <db>` | drop stale archived logs before a re-seed |
 | `start-hadr.sh <primary\|standby> <db>` | `START HADR` behind IBM's precondition guards |
 | `takeover.sh <db> [--peer-window-only\|--graceful\|--force]` | promote a standby |
+| `stop-hadr.sh <db>` | `STOP HADR`; the database stays |
+| `drop-db.sh <db>` | drop a database's **standby** copy; refuses a primary or standard database |
+| `fence-watchdog.sh` | not a step: a loop started by the db2 container's postStart hook. See below |
 
 The coordinator sidecar moves the backup **bytes** between the two FIFOs in Go.
 These scripts only set up the Db2 side. Bulk data never passes through the
 kube-apiserver — doing so is what produced
 `SQL2538N Unexpected End of File of Backup Image`.
+
+## The fence watchdog
+
+`fence-watchdog.sh` stops this pod's instance when it has lost the primary lease and could be
+replaced. The coordinator renews the lease (`<db2>-hadr-primary`) and, after each renewal, writes a
+deadline to `/database/.hadr-lease-deadline`. The watchdog fences only when all three hold:
+
+- the deadline file exists;
+- the deadline has passed;
+- some database here is an HADR PRIMARY with no standby in `PEER`.
+
+A primary whose standby is still in `PEER` is never fenced: nobody can promote that standby, so an API
+server outage alone never stops a healthy pair.
+
+Fencing is `db2 force application all`, then `db2stop force` in the background. If the engine is still
+up after 15 s, `db2_kill` (never a signal to `db2stop`: it answers with an FODC dump). Then `ipclean`,
+only after a kill and only with no engine running, and finally `db2start`. With no database active, a
+primary can only activate again once it reaches its standby, so it cannot take writes alone.
+
+It runs here, not in the coordinator, because the coordinator reaches Db2 only through the API
+server's exec, which is exactly what a cut-off pod has lost. It logs to the container's stdout
+(`kubectl logs <pod> -c db2 | grep fence-watchdog`). Design: `ai-prompt/db2/clustering/prompt/design.md`
+§6.2.
 
 ## Things these scripts exist to get right
 
@@ -91,4 +117,8 @@ make push
 
 `DB2_INSTANCE` (db2inst1) · `DB2_INSTANCE_GROUP` (db2iadm1) · `DB2_DATA_DIR`
 (/database) · `DB2_ARCHIVE_DIR` (/database/logs) · `DB2_HADR_SYNCMODE` (NEARSYNC)
-· `DB2_HADR_TIMEOUT` (120) · `DB2_HADR_PEER_WINDOW` (120)
+· `DB2_HADR_TIMEOUT` (60) · `DB2_HADR_PEER_WINDOW` (120; must be at least the timeout + 60, see the
+operator's webhook)
+
+Watchdog: `HADR_FENCE_INTERVAL_SECONDS` (2) · `HADR_FENCE_STOP_TIMEOUT_SECONDS` (15) ·
+`HADR_FENCE_BACKOFF_SECONDS` (30) · `HADR_LEASE_DEADLINE_FILE` (/database/.hadr-lease-deadline)

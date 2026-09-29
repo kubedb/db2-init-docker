@@ -30,7 +30,7 @@ case "$ROLE" in
   *) die "role must be primary | principal | auxiliary (got '${ROLE}')" ;;
 esac
 
-TIMEOUT="${DB2_HADR_TIMEOUT:-120}"
+TIMEOUT="${DB2_HADR_TIMEOUT:-60}"
 # Peer window is only meaningful under SYNC/NEARSYNC; Db2 ignores it otherwise.
 if [ "$SYNCMODE" = "SUPERASYNC" ] || [ "$SYNCMODE" = "ASYNC" ]; then
   PEER_WINDOW=0
