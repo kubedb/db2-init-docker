@@ -44,15 +44,32 @@ if [ "$CUR" = "OFF" ]; then
   mkdir -p "${DATA_DIR}/backup"
   chown "${INSTANCE}:${INSTANCE_GROUP}" "${DATA_DIR}/backup"
   # The coordinator sidecar holds health connections over 127.0.0.1, so an
-  # offline backup fails with SQL1035N unless everything is forced off first.
-  force_quiesce "$DB"
+  # offline backup fails with SQL1035N unless this database's connections are
+  # forced off first - and the sidecar reconnects every few seconds, so it is
+  # retried. Only THIS database is quiesced: recycling the instance would take
+  # down every other database's HADR with it.
   log "taking the offline backup required to clear BACKUP PENDING"
-  out=$(run_db2 "db2 backup database ${DB} to ${DATA_DIR}/backup") || true
-  printf '%s\n' "$out" >&2
-  # BACKUP reports success as "Backup successful.", not DB20000I - the CLP uses
-  # a different success line for this command than for UPDATE DB CFG.
-  printf '%s\n' "$out" | grep -q "Backup successful" \
-    || die "offline backup after enabling archive logging failed: ${out}"
+  ok=false
+  for attempt in 1 2 3 4 5; do
+    quiesce_db "$DB"
+    out=$(run_db2 "db2 backup database ${DB} to ${DATA_DIR}/backup") || true
+    printf '%s\n' "$out" >&2
+    # BACKUP reports success as "Backup successful.", not DB20000I - the CLP uses
+    # a different success line for this command than for UPDATE DB CFG.
+    if printf '%s\n' "$out" | grep -q "Backup successful"; then ok=true; break; fi
+    log "offline backup attempt ${attempt} did not take: $(printf '%s' "$out" | grep -oE 'SQL[0-9]+[NWC]' | tail -1)"
+    sleep 2
+  done
+  if ! $ok; then
+    others=$(other_hadr_active "$DB")
+    [ -z "$others" ] || die "offline backup of ${DB} failed, and the instance is not recycled while other HADR databases are active here (${others% }): ${out}"
+    log "no other HADR database is active here; recycling the instance for the backup"
+    force_quiesce "$DB"
+    out=$(run_db2 "db2 backup database ${DB} to ${DATA_DIR}/backup") || true
+    printf '%s\n' "$out" >&2
+    printf '%s\n' "$out" | grep -q "Backup successful" \
+      || die "offline backup after enabling archive logging failed: ${out}"
+  fi
 else
   log "LOGARCHMETH1 already set (${CUR}) - nothing to do"
 fi

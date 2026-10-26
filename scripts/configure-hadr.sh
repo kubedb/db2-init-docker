@@ -72,6 +72,24 @@ while read -r param value; do
     || die "UPDATE DB CFG ${param} ${value} failed: ${out}"
 done < "$CFG"
 
+# LOGINDEXBUILD is only picked up when the database is next activated. The
+# operator's health checker keeps a freshly created database active, so without
+# this its in-memory value stays OFF: indexes built on the primary are not
+# logged, and a read-enabled standby refuses to read any table that has one
+# (SQL1773N rc=2). Deactivate now, while HADR is not running yet, so that START
+# HADR AS PRIMARY activates it with the new value. A database already running
+# HADR is left alone - deactivating it would take the pair down.
+idx=$(run_db2 "db2 connect to ${DB} >/dev/null; db2 get db cfg for ${DB} show detail" \
+  | awk '/\(LOGINDEXBUILD\)/ {print $(NF-1)}') || true
+if [ -n "${idx:-}" ] && [ "$idx" != "ON" ]; then
+  if [ -z "$(hadr_runtime_role "$DB")" ]; then
+    log "LOGINDEXBUILD is still ${idx} in memory; deactivating ${DB} so ON takes effect"
+    quiesce_db "$DB"
+  else
+    log "WARNING: LOGINDEXBUILD is ${idx} in memory on ${DB}, which is running HADR; indexes built before its next activation are not readable on the standby"
+  fi
+fi
+
 # HADR_TARGET_LIST is separate: it is quoted, and it is only set for >1 standby.
 # Order is promotion policy - the first entry is the principal standby, and after
 # a takeover the first entry of the NEW primary's list becomes the next principal.

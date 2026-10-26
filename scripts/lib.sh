@@ -90,25 +90,68 @@ force_quiesce() {                # force_quiesce <db>
   run_db2 "db2start"                   >/dev/null 2>&1 || true
 }
 
+# Names of the OTHER databases on this pod that have HADR running (primary or
+# standby), space separated. Recycling the instance takes every one of them
+# down, so anything that considers it must ask first.
+other_hadr_active() {            # other_hadr_active <db>
+  local DB; DB=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+  run_db2 "db2pd -hadr -alldbs" | awk -v d="$DB" '
+    /-- Database / { for (i = 1; i < NF - 1; i++) if ($i == "--" && $(i + 1) == "Database") { cur = $(i + 2); break } }
+    /^[[:space:]]*HADR_ROLE[[:space:]]*=/ { if (cur != d) seen[cur] = 1 }
+    END { for (x in seen) printf "%s ", x }'
+}
+
+# Take ONE database's connections away - the sidecar's health connections above
+# all - without touching the rest of the instance. Forces only this database's
+# applications, then deactivates it. Unlike force_quiesce this is safe while other
+# databases are serving: recycling the instance to repair archive logging on a
+# leftover copy took down the freshly promoted primary next to it (observed
+# 2026-09-30: primary lost mid-seed, the new primary's TESTDB knocked out by the
+# repair of a half-restored SALES).
+quiesce_db() {                   # quiesce_db <db>
+  local db="$1" DB
+  DB=$(printf '%s' "$db" | tr '[:lower:]' '[:upper:]')
+  run_db2 "h=\$(db2 list applications for database ${db} 2>/dev/null | awk -v d=${DB} '\$5==d {print \$3}' | paste -sd, -); \
+    [ -n \"\$h\" ] && db2 \"force application (\$h)\"; sleep 1; db2 terminate; db2 deactivate db ${db}" >/dev/null 2>&1 || true
+}
+
 # Drop a database that something keeps holding open.
 #
 # The operator's own health checker reconnects to this database every few
 # seconds, so a drop issued as a separate command after quiescing loses the race
-# and returns SQL1035N. The whole sequence therefore runs inside ONE `su -`, back
-# to back, leaving no window for a reconnect - and is retried, because a single
+# and returns SQL1035N. The sequence therefore runs inside ONE `su -`, back to
+# back, leaving no window for a reconnect - and is retried, because a single
 # unlucky pass is not a reason to fail a seed.
+#
+# Scoped to this one database. Forcing every application and recycling the
+# instance - what this used to do - also deactivates every OTHER database's HADR
+# copy on the pod: re-seeding SALES on a standby knocked TESTDB's standby out of
+# PEER, and a primary lost in that window could not be failed over (observed
+# 2026-09-29). The instance is recycled only as a last resort, and never while
+# another database here is an active HADR copy.
 drop_db_forcefully() {           # drop_db_forcefully <db>
-  local db="$1" out i
-  for i in 1 2 3; do
-    out=$(run_db2 "db2 force applications all; db2 terminate; db2 deactivate db ${db}; db2stop force; db2start; db2 deactivate db ${db}; db2 drop db ${db}") || true
+  local db="$1" DB out i others
+  DB=$(printf '%s' "$db" | tr '[:lower:]' '[:upper:]')
+  for i in 1 2 3 4 5; do
+    out=$(run_db2 "h=\$(db2 list applications for database ${db} 2>/dev/null | awk -v d=${DB} '\$5==d {print \$3}' | paste -sd, -); \
+      [ -n \"\$h\" ] && db2 \"force application (\$h)\"; sleep 1; \
+      db2 terminate; db2 deactivate db ${db}; db2 drop db ${db}") || true
     if ! db_exists "$db"; then
-      log "dropped ${db} (attempt ${i})"
+      log "dropped ${db} (attempt ${i}, scoped to ${db})"
       return 0
     fi
-    log "drop attempt ${i} did not take: $(printf '%s' "$out" | grep -oE 'SQL[0-9]+[NWC]' | tail -1)"
-    sleep 3
+    log "scoped drop attempt ${i} did not take: $(printf '%s' "$out" | grep -oE 'SQL[0-9]+[NWC]' | tail -1)"
+    sleep 2
   done
-  die "could not drop ${db} after 3 attempts: ${out}"
+
+  others=$(other_hadr_active "$db")
+  if [ -n "$others" ]; then
+    die "could not drop ${db}; not recycling the instance because other HADR databases are active here (${others% }): ${out}"
+  fi
+  log "no other HADR database is active here; recycling the instance to drop ${db}"
+  out=$(run_db2 "db2 force applications all; db2 terminate; db2 deactivate db ${db}; db2stop force; db2start; db2 deactivate db ${db}; db2 drop db ${db}") || true
+  db_exists "$db" && die "could not drop ${db}: ${out}"
+  log "dropped ${db} after recycling the instance"
 }
 
 # ------------------------------------------------------------ /etc/hosts pins
